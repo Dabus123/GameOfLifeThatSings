@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recursive Life</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,600;1,300&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    overflow: hidden;
+    font-family: 'IBM Plex Mono', monospace;
+    color: #e8e0ff;
+    cursor: crosshair;
+  }
+  canvas { display: block; }
+
+  #ui {
+    position: fixed; top: 20px; left: 20px; z-index: 10;
+    pointer-events: none; font-size: 10px;
+    letter-spacing: 0.1em; text-transform: uppercase; line-height: 2;
+  }
+  .lbl { color: #222; }
+  .val { color: #fff; font-size: 11px; }
+
+  #controls {
+    position: fixed; bottom: 20px; left: 50%;
+    transform: translateX(-50%);
+    display: flex; gap: 8px; z-index: 10;
+  }
+  button {
+    background: transparent; border: 1px solid #ffffff18;
+    color: #888; padding: 7px 16px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px; letter-spacing: 0.14em;
+    text-transform: uppercase; cursor: pointer; transition: all 0.15s;
+  }
+  button:hover { color: #fff; border-color: #ffffff55; }
+  button.active { color: #fff; border-color: #fff; background: #ffffff0a; }
+
+  #hint {
+    position: fixed; bottom: 56px; left: 50%;
+    transform: translateX(-50%);
+    font-size: 8px; letter-spacing: 0.22em;
+    text-transform: uppercase; color: #111;
+    white-space: nowrap; z-index: 10;
+  }
+
+  #view-label {
+    position: fixed; top: 20px; right: 20px;
+    font-size: 9px; letter-spacing: 0.16em;
+    text-transform: uppercase; color: #222;
+    text-align: right; line-height: 2.2; z-index: 10;
+    pointer-events: none;
+  }
+  #view-label .bright { color: #888; }
+
+  /* Zoom transition overlay */
+  #flash {
+    position: fixed; inset: 0; background: #fff;
+    opacity: 0; pointer-events: none; z-index: 100;
+    transition: opacity 0.08s;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="flash"></div>
+
+<div id="ui">
+  <div class="lbl">Outer gen</div><div class="val" id="outer-gen">0</div>
+  <div class="lbl">Running universes</div><div class="val" id="running">0</div>
+  <div class="lbl">Frozen universes</div><div class="val" id="frozen">0</div>
+  <div class="lbl">Total inner gen</div><div class="val" id="inner-gen">0</div>
+</div>
+
+<div id="view-label">
+  <div>Viewing: <span class="bright" id="view-mode">Outer grid</span></div>
+  <div id="cell-info"></div>
+</div>
+
+<div id="hint">click alive cell to enter its universe · backspace to exit</div>
+<div id="vol-wrap" style="position:fixed;bottom:56px;right:20px;z-index:10;display:flex;align-items:center;gap:8px;font-family:'IBM Plex Mono',monospace;font-size:8px;letter-spacing:0.15em;text-transform:uppercase;color:#222;">
+  Vol <input type="range" id="vol" min="0" max="100" value="60" style="-webkit-appearance:none;width:70px;height:2px;background:#1a1a1a;outline:none;">
+</div>
+
+<div id="controls">
+  <button class="active" id="btnPlay">⏸ Pause</button>
+  <button id="btnStep">Step</button>
+  <button id="btnReset">↺ Reset</button>
+  <button id="btnExit">↑ Exit Universe</button>
+  <button id="btnSound">♪ Sound: Off</button>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// RECURSIVE LIFE
+//
+// Outer grid: N×N of cells. Each cell is alive or dead per B3/S23.
+// Each cell CONTAINS a full inner Life grid (M×M).
+// - Alive cell: its inner grid RUNS each outer tick
+// - Dead cell:  its inner grid is FROZEN — time stops inside it
+//
+// You can click any alive cell to ENTER it — you zoom into its
+// inner universe and watch it run. While you're inside, the outer
+// grid keeps ticking. When the cell you're inside dies, you feel it:
+// the inner grid freezes mid-pattern.
+//
+// The outer grid's birth/survival rules literally decide
+// which inner universes get to experience time.
+// ═══════════════════════════════════════════════════════════════════
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const W = () => innerWidth;
+const H = () => innerHeight;
+canvas.width  = W();
+canvas.height = H();
+window.addEventListener('resize', () => {
+  canvas.width = W(); canvas.height = H();
+});
+
+// ── CONFIG ───────────────────────────────────────────────────────
+const OUTER_N   = 100;   // outer grid size (100×100 = 10,000 universes)
+const INNER_N   = 12;    // each inner universe is 12×12 (keeps pixel budget sane)
+const OUTER_TICK_MS = 250;
+const INNER_TICKS_PER_OUTER = 1; // 1 step per outer tick — 10k universes is enough
+
+// ── OUTER GRID ───────────────────────────────────────────────────
+const outerCells = new Uint8Array(OUTER_N * OUTER_N); // 0=dead, 1=alive
+const outerNext  = new Uint8Array(OUTER_N * OUTER_N);
+let outerGen = 0;
+
+function oIdx(c, r) { return r * OUTER_N + c; }
+function oGet(c, r) {
+  return outerCells[oIdx((c+OUTER_N)%OUTER_N, (r+OUTER_N)%OUTER_N)];
+}
+
+function outerStep() {
+  for (let r = 0; r < OUTER_N; r++) for (let c = 0; c < OUTER_N; c++) {
+    const nb =
+      oGet(c-1,r-1)+oGet(c,r-1)+oGet(c+1,r-1)+
+      oGet(c-1,r  )+             oGet(c+1,r  )+
+      oGet(c-1,r+1)+oGet(c,r+1)+oGet(c+1,r+1);
+    const alive = outerCells[oIdx(c,r)];
+    outerNext[oIdx(c,r)] = alive ? (nb===2||nb===3?1:0) : (nb===3?1:0);
+  }
+  outerCells.set(outerNext);
+  outerGen++;
+}
+
+// ── INNER UNIVERSES ──────────────────────────────────────────────
+// One inner grid per outer cell
+const N2 = INNER_N * INNER_N;
+const innerCells = []; // [outerIdx] = Uint8Array
+const innerNext  = [];
+const innerGens  = new Uint32Array(OUTER_N * OUTER_N); // gen count per universe
+const innerAlive = new Uint32Array(OUTER_N * OUTER_N); // live cell count cache
+
+for (let i = 0; i < OUTER_N * OUTER_N; i++) {
+  innerCells.push(new Uint8Array(N2));
+  innerNext.push(new Uint8Array(N2));
+}
+
+function iIdx(c, r) { return r * INNER_N + c; }
+function iGet(cells, c, r) {
+  return cells[iIdx((c+INNER_N)%INNER_N, (r+INNER_N)%INNER_N)];
+}
+
+function innerStep(idx) {
+  const g = innerCells[idx], n = innerNext[idx];
+  let alive = 0;
+  for (let r = 0; r < INNER_N; r++) for (let c = 0; c < INNER_N; c++) {
+    const nb =
+      iGet(g,c-1,r-1)+iGet(g,c,r-1)+iGet(g,c+1,r-1)+
+      iGet(g,c-1,r  )+               iGet(g,c+1,r  )+
+      iGet(g,c-1,r+1)+iGet(g,c,r+1)+iGet(g,c+1,r+1);
+    const a = g[iIdx(c,r)];
+    n[iIdx(c,r)] = a ? (nb===2||nb===3?1:0) : (nb===3?1:0);
+    alive += n[iIdx(c,r)];
+  }
+  innerCells[idx].set(innerNext[idx]);
+  innerGens[idx]++;
+  innerAlive[idx] = alive;
+}
+
+function randomizeInner(idx, density) {
+  const g = innerCells[idx];
+  let alive = 0;
+  for (let i = 0; i < N2; i++) {
+    g[i] = Math.random() < density ? 1 : 0;
+    alive += g[i];
+  }
+  innerAlive[idx] = alive;
+  innerGens[idx] = 0;
+}
+
+function initAll() {
+  // Random outer seed
+  for (let i = 0; i < OUTER_N * OUTER_N; i++)
+    outerCells[i] = Math.random() < 0.38 ? 1 : 0;
+
+  // Each inner universe gets a unique random seed
+  for (let i = 0; i < OUTER_N * OUTER_N; i++)
+    randomizeInner(i, 0.3 + Math.random() * 0.2);
+
+  outerGen = 0;
+}
+
+// ── STEP EVERYTHING ──────────────────────────────────────────────
+let totalInnerGen = 0;
+
+function stepEverything() {
+  // First: step inner universes for alive cells
+  let running = 0, frozen = 0;
+  for (let i = 0; i < OUTER_N * OUTER_N; i++) {
+    if (outerCells[i]) {
+      for (let t = 0; t < INNER_TICKS_PER_OUTER; t++) innerStep(i);
+      running++;
+    } else {
+      frozen++;
+    }
+  }
+  totalInnerGen += running * INNER_TICKS_PER_OUTER;
+
+  // Then: step outer
+  outerStep();
+
+  // Handle births: newly alive cells get a fresh random seed
+  // (they were born — their universe flickers to life)
+  for (let i = 0; i < OUTER_N * OUTER_N; i++) {
+    if (outerCells[i] && innerGens[i] === 0) {
+      randomizeInner(i, 0.28 + Math.random() * 0.25);
+    }
+  }
+
+  document.getElementById('outer-gen').textContent = outerGen;
+  document.getElementById('running').textContent = running;
+  document.getElementById('frozen').textContent = frozen;
+  document.getElementById('inner-gen').textContent = totalInnerGen.toLocaleString();
+
+  // Emit decision tones — births and deaths only
+  updateSound();
+}
+
+// ── VIEW STATE ───────────────────────────────────────────────────
+// null = outer view, {c, r} = inside that cell's universe
+let viewCell = null;
+
+function enterCell(c, r) {
+  if (!outerCells[oIdx(c,r)]) return; // can't enter dead universe
+  viewCell = { c, r };
+  document.getElementById('view-mode').textContent = `Cell [${c},${r}]`;
+  document.getElementById('cell-info').textContent = '';
+  document.getElementById('back-hint')?.remove();
+  flash();
+  updateViewLabel();
+}
+
+function exitCell() {
+  viewCell = null;
+  document.getElementById('view-mode').textContent = 'Outer grid';
+  document.getElementById('cell-info').textContent = '';
+  flash();
+  updateViewLabel();
+}
+
+function updateViewLabel() {
+  const info = document.getElementById('cell-info');
+  if (viewCell) {
+    const idx = oIdx(viewCell.c, viewCell.r);
+    const alive = outerCells[idx];
+    const status = alive ? '▶ running' : '■ frozen';
+    info.textContent = `gen ${innerGens[idx]} · ${status}`;
+    info.style.color = alive ? '#888' : '#333';
+  }
+}
+
+function flash() {
+  const el = document.getElementById('flash');
+  el.style.opacity = '0.3';
+  setTimeout(() => { el.style.opacity = '0'; }, 80);
+}
+
+// ── DRAW ─────────────────────────────────────────────────────────
+let hovC = -1, hovR = -1;
+
+// Color palette
+const C_ALIVE_BG    = '#0a0a12';
+const C_DEAD_BG     = '#000';
+const C_INNER_ALIVE = '#ffffff';
+const C_INNER_DIM   = '#1a1a2e';
+const C_GRID_LINE   = '#0d0d1a';
+const C_FROZEN_TINT = 'rgba(40,0,80,0.35)';
+const C_HOVER       = 'rgba(255,255,255,0.06)';
+const C_BORDER_ALIVE = '#ffffff22';
+
+// Offscreen pixel buffer for fast outer rendering
+let imgData = null;
+let imgBuf   = null;
+
+function ensureImageData() {
+  if (!imgData || imgData.width !== W() || imgData.height !== H()) {
+    imgData = ctx.createImageData(W(), H());
+    imgBuf  = new Uint32Array(imgData.data.buffer);
+  }
+}
+
+// Pack RGBA into a Uint32 (little-endian: ABGR in memory)
+function rgba(r,g,b,a=255) {
+  return (a<<24)|(b<<16)|(g<<8)|r;
+}
+
+const COL_BG         = rgba(0,0,0);
+const COL_ALIVE_CELL = rgba(255,255,255);
+const COL_FROZEN_CELL= rgba(100,40,180);
+const COL_OUTER_ALIVE= rgba(8,8,18);
+const COL_OUTER_DEAD = rgba(2,0,4);
+const COL_SEP        = rgba(12,8,20);
+
+function drawOuter() {
+  ensureImageData();
+  const pw = W(), ph = H();
+  const PAD = 20;
+  const gridW = pw - PAD*2;
+  const gridH = ph - PAD*2;
+  // Each outer cell gets exactly cellPx × cellPx pixels
+  const cellPx = Math.floor(Math.min(gridW, gridH) / OUTER_N);
+  const totalPx = cellPx * OUTER_N;
+  const ox = Math.floor((pw - totalPx) / 2);
+  const oy = Math.floor((ph - totalPx) / 2);
+
+  // Each inner cell gets innerPx pixels inside the outer cell
+  // Leave 1px border between outer cells
+  const innerPx = Math.max(1, Math.floor((cellPx - 1) / INNER_N));
+
+  // Fill background
+  imgBuf.fill(COL_BG);
+
+  for (let or = 0; or < OUTER_N; or++) {
+    for (let oc = 0; oc < OUTER_N; oc++) {
+      const idx   = oIdx(oc, or);
+      const alive = outerCells[idx];
+      const g     = innerCells[idx];
+      const cellX = ox + oc * cellPx;
+      const cellY = oy + or * cellPx;
+      const bgCol = alive ? COL_OUTER_ALIVE : COL_OUTER_DEAD;
+
+      // Fill outer cell background
+      for (let py = 0; py < cellPx - 1; py++) {
+        const rowBase = (cellY + py) * pw + cellX;
+        for (let px = 0; px < cellPx - 1; px++) {
+          imgBuf[rowBase + px] = bgCol;
+        }
+      }
+
+      // Draw inner cells as pixels
+      if (innerPx >= 1) {
+        const innerCol = alive ? COL_ALIVE_CELL : COL_FROZEN_CELL;
+        const alpha = alive ? 1.0 : 0.3;
+        for (let ir = 0; ir < INNER_N; ir++) {
+          for (let ic = 0; ic < INNER_N; ic++) {
+            if (!g[iIdx(ic, ir)]) continue;
+            const px0 = cellX + ic * innerPx;
+            const py0 = cellY + ir * innerPx;
+            for (let dy = 0; dy < innerPx; dy++) {
+              const rowBase = (py0 + dy) * pw + px0;
+              for (let dx = 0; dx < innerPx; dx++) {
+                if (alive) {
+                  imgBuf[rowBase + dx] = innerCol;
+                } else {
+                  // Dim frozen cells
+                  imgBuf[rowBase + dx] = rgba(60,20,110);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Hover highlight
+      if (oc === hovC && or === hovR && alive) {
+        for (let py = 0; py < cellPx - 1; py++) {
+          const rowBase = (cellY + py) * pw + cellX;
+          for (let px = 0; px < cellPx - 1; px++) {
+            const cur = imgBuf[rowBase + px];
+            // brighten
+            imgBuf[rowBase + px] = rgba(
+              Math.min(255, ((cur) & 0xff) + 40),
+              Math.min(255, ((cur>>8) & 0xff) + 40),
+              Math.min(255, ((cur>>16) & 0xff) + 40)
+            );
+          }
+        }
+      }
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+
+  // Hover border on top
+  if (hovC >= 0 && hovR >= 0) {
+    const cellPxC = Math.floor(Math.min(W()-PAD*2, H()-PAD*2) / OUTER_N);
+    const totalPxC = cellPxC * OUTER_N;
+    const oxC = Math.floor((W() - totalPxC) / 2);
+    const oyC = Math.floor((H() - totalPxC) / 2);
+    const hx = oxC + hovC * cellPxC;
+    const hy = oyC + hovR * cellPxC;
+    ctx.strokeStyle = outerCells[oIdx(hovC,hovR)] ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(hx+0.5, hy+0.5, cellPxC-1, cellPxC-1);
+  }
+}
+
+// Keep for inner view compatibility (unused in outer)
+function drawInnerMini() {}
+
+function drawInner() {
+  // Full-screen view of one cell's inner universe
+  const idx   = oIdx(viewCell.c, viewCell.r);
+  const alive = outerCells[idx];
+  const g     = innerCells[idx];
+
+  const PAD = 60;
+  const size = Math.min(W(), H()) - PAD*2;
+  const ox   = (W() - size) / 2;
+  const oy   = (H() - size) / 2;
+  const cs   = size / INNER_N;
+
+  // Background
+  ctx.fillStyle = alive ? '#04020f' : '#000';
+  ctx.fillRect(0, 0, W(), H());
+
+  // Frozen label
+  if (!alive) {
+    ctx.fillStyle = '#1a0033';
+    ctx.fillRect(0, 0, W(), H());
+    ctx.font = '10px IBM Plex Mono';
+    ctx.fillStyle = '#440066';
+    ctx.letterSpacing = '0.3em';
+    ctx.textAlign = 'center';
+    ctx.fillText('THIS UNIVERSE IS FROZEN', W()/2, 28);
+    ctx.letterSpacing = '0';
+  }
+
+  // Grid lines
+  ctx.strokeStyle = alive ? '#0d0820' : '#0a0014';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= INNER_N; i++) {
+    ctx.beginPath(); ctx.moveTo(ox + i*cs, oy); ctx.lineTo(ox + i*cs, oy+size); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ox, oy + i*cs); ctx.lineTo(ox+size, oy + i*cs); ctx.stroke();
+  }
+
+  // Cells
+  for (let r = 0; r < INNER_N; r++) {
+    for (let c = 0; c < INNER_N; c++) {
+      if (!g[iIdx(c,r)]) continue;
+      const x = ox + c*cs + 1;
+      const y2 = oy + r*cs + 1;
+      const cw = cs - 2;
+
+      if (alive) {
+        ctx.shadowColor = '#ffffff';
+        ctx.shadowBlur  = cs * 0.5;
+        ctx.fillStyle   = '#ffffff';
+      } else {
+        ctx.fillStyle = '#6622aa';
+      }
+      ctx.fillRect(x, y2, cw, cw);
+    }
+  }
+  ctx.shadowBlur = 0;
+
+  // Info bar
+  const gen = innerGens[idx];
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = alive ? '#333' : '#2a0044';
+  ctx.textAlign = 'left';
+  ctx.fillText(`INNER GEN ${gen}  ·  CELL [${viewCell.c}, ${viewCell.r}]  ·  ${alive ? 'RUNNING' : 'FROZEN — OUTER CELL DIED'}`, ox, oy + size + 20);
+}
+
+function draw() {
+  if (viewCell) drawInner();
+  else drawOuter();
+
+  // Update live label if inside
+  if (viewCell) updateViewLabel();
+}
+
+// ── MOUSE ────────────────────────────────────────────────────────
+function outerScreenToCell(ex, ey) {
+  const PAD = 20;
+  const cellPx = Math.floor(Math.min(W()-PAD*2, H()-PAD*2) / OUTER_N);
+  const totalPx = cellPx * OUTER_N;
+  const ox = Math.floor((W() - totalPx) / 2);
+  const oy = Math.floor((H() - totalPx) / 2);
+  const c = Math.floor((ex - ox) / cellPx);
+  const r = Math.floor((ey - oy) / cellPx);
+  if (c < 0 || c >= OUTER_N || r < 0 || r >= OUTER_N) return null;
+  return { c, r };
+}
+
+canvas.addEventListener('mousemove', e => {
+  if (viewCell) return;
+  const cell = outerScreenToCell(e.clientX, e.clientY);
+  if (cell) { hovC = cell.c; hovR = cell.r; }
+  else { hovC = -1; hovR = -1; }
+});
+canvas.addEventListener('mouseleave', () => { hovC = -1; hovR = -1; });
+
+canvas.addEventListener('click', e => {
+  if (viewCell) return;
+  const cell = outerScreenToCell(e.clientX, e.clientY);
+  if (!cell) return;
+  if (outerCells[oIdx(cell.c, cell.r)]) enterCell(cell.c, cell.r);
+});
+
+window.addEventListener('keydown', e => {
+  if (e.key === 'Backspace' || e.key === 'Escape') exitCell();
+});
+
+
+// ── AUDIO ENGINE — DECISION MAPPER ──────────────────────────────
+// We do NOT map density or state to sound.
+// We ONLY emit sound on CHANGE — birth or death of an outer cell.
+// Each cell's position maps to pitch and stereo field.
+// Left→Right = low→high frequency (pentatonic)
+// Top→Bottom = two timbres (sine births, sawtooth deaths)
+// You are hearing the simulation's decisions, not its state.
+// If there is a pattern in what it chooses — you will hear it.
+
+let audioCtx    = null;
+let soundOn     = false;
+let masterGain  = null;
+let reverbSend  = null;
+let convolver   = null;
+
+// Previous outer state snapshot for diffing
+let prevOuter = new Uint8Array(OUTER_N * OUTER_N);
+
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx   = new (window.AudioContext || window.webkitAudioContext)();
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = 0;
+  masterGain.connect(audioCtx.destination);
+
+  // Deep space reverb
+  convolver   = audioCtx.createConvolver();
+  const irLen = Math.floor(audioCtx.sampleRate * 1.5);
+  const irBuf = audioCtx.createBuffer(2, irLen, audioCtx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = irBuf.getChannelData(ch);
+    for (let i = 0; i < irLen; i++)
+      d[i] = (Math.random()*2-1) * Math.pow(1 - i/irLen, 1.8);
+  }
+  convolver.buffer = irBuf;
+  reverbSend = audioCtx.createGain();
+  reverbSend.gain.value = 0.18;
+  convolver.connect(reverbSend);
+  reverbSend.connect(masterGain);
+
+  // Copy current state as baseline
+  prevOuter.set(outerCells);
+}
+
+// Pentatonic scale across full pitch range
+// 100 columns → 3 octaves of A pentatonic rooted at 110hz
+// A pentatonic ratios: 1, 9/8, 5/4, 3/2, 5/3
+function colToFreq(c) {
+  const pentatonicRatios = [1, 9/8, 5/4, 3/2, 5/3];
+  const octave   = Math.floor(c / (OUTER_N / 3));
+  const degree   = Math.floor((c % (OUTER_N / 3)) / (OUTER_N / 15));
+  const baseFreq = 110 * Math.pow(2, octave);
+  return baseFreq * pentatonicRatios[degree % 5];
+}
+
+
+// Row maps to stereo pan (top=left, bottom=right)
+function rowToPan(r) {
+  return (r / (OUTER_N - 1)) * 2 - 1; // -1 to +1
+}
+
+// Row maps to amplitude — center rows louder (spatial presence)
+function rowToGain(r) {
+  const center = (OUTER_N - 1) / 2;
+  const dist   = Math.abs(r - center) / center;
+  return 0.06 * (1 - dist * 0.5);
+}
+
+// Emit a single decision tone
+function emitTone(c, r, isBirth) {
+  if (!audioCtx || !soundOn) return;
+  const now  = audioCtx.currentTime;
+  const freq = colToFreq(c);
+  const pan  = rowToPan(r);
+  const gain = rowToGain(r);
+
+  const osc     = audioCtx.createOscillator();
+  const env     = audioCtx.createGain();
+  const panner  = audioCtx.createStereoPanner();
+
+  // Birth = sine (clean), Death = triangle (hollow)
+  osc.type = isBirth ? 'sine' : 'triangle';
+
+  // Birth = pentatonic freq. Death = same freq, glides down a minor third.
+  osc.frequency.value = freq;
+  if (!isBirth) {
+    osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.75, audioCtx.currentTime + 0.5);
+  }
+
+  panner.pan.value = pan;
+
+  // Envelope: births have sharp attack, long tail
+  // Deaths have slightly slower attack, shorter tail
+  env.gain.setValueAtTime(0, now);
+  if (isBirth) {
+    env.gain.linearRampToValueAtTime(gain, now + 0.015);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + 1.2);
+  } else {
+    env.gain.linearRampToValueAtTime(gain * 0.7, now + 0.04);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + 0.7);
+  }
+
+  osc.connect(env);
+  env.connect(panner);
+  panner.connect(masterGain);
+  panner.connect(convolver);
+
+  osc.start(now);
+  osc.stop(now + 1.5);
+}
+
+// Called every outer tick — diff against previous state
+// Emit a tone for every birth and death
+// To avoid audio explosion, we batch and limit per tick
+const MAX_EVENTS_PER_TICK = 24; // too many = mud
+
+function updateSound() {
+  if (!soundOn || !audioCtx) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+
+  const vol = parseInt(document.getElementById('vol').value) / 100;
+  masterGain.gain.setTargetAtTime(vol * 0.6, audioCtx.currentTime, 0.05);
+
+  // Collect all changes
+  const births = [];
+  const deaths = [];
+
+  for (let r = 0; r < OUTER_N; r++) {
+    for (let c = 0; c < OUTER_N; c++) {
+      const i    = oIdx(c, r);
+      const was  = prevOuter[i];
+      const now2 = outerCells[i];
+      if (!was && now2) births.push({c, r});
+      else if (was && !now2) deaths.push({c, r});
+    }
+  }
+
+  // Shuffle and limit so we don't get mud
+  // Prioritize spatially spread events
+  const stride = Math.max(1, Math.floor(births.length / (MAX_EVENTS_PER_TICK / 2)));
+  for (let i = 0; i < births.length; i += stride) emitTone(births[i].c, births[i].r, true);
+
+  const dstride = Math.max(1, Math.floor(deaths.length / (MAX_EVENTS_PER_TICK / 2)));
+  for (let i = 0; i < deaths.length; i += dstride) emitTone(deaths[i].c, deaths[i].r, false);
+
+  // Update snapshot
+  prevOuter.set(outerCells);
+}
+
+// ── LOOP ─────────────────────────────────────────────────────────
+let running = true, lastTick = 0;
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  if (running && ts - lastTick > OUTER_TICK_MS) {
+    stepEverything();
+    lastTick = ts;
+  }
+  draw();
+}
+
+initAll();
+requestAnimationFrame(loop);
+
+// ── BUTTONS ──────────────────────────────────────────────────────
+document.getElementById('btnPlay').addEventListener('click', () => {
+  running = !running;
+  const btn = document.getElementById('btnPlay');
+  btn.textContent = running ? '⏸ Pause' : '▶ Play';
+  btn.classList.toggle('active', running);
+});
+document.getElementById('btnStep').addEventListener('click', () => {
+  stepEverything();
+});
+document.getElementById('btnReset').addEventListener('click', () => {
+  viewCell = null;
+  exitCell();
+  initAll();
+  totalInnerGen = 0;
+  document.getElementById('outer-gen').textContent = 0;
+  document.getElementById('inner-gen').textContent = 0;
+});
+document.getElementById('btnExit').addEventListener('click', exitCell);
+
+document.getElementById('btnSound').addEventListener('click', () => {
+  const btn = document.getElementById('btnSound');
+  if (!soundOn) {
+    initAudio();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    soundOn = true;
+    btn.textContent = '♪ Sound: On';
+    btn.classList.add('active');
+  } else {
+    soundOn = false;
+    if (masterGain) masterGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.3);
+    btn.textContent = '♪ Sound: Off';
+    btn.classList.remove('active');
+  }
+});
+
+document.getElementById('vol').addEventListener('input', () => {
+  if (!soundOn || !masterGain) return;
+  const vol = parseInt(document.getElementById('vol').value) / 100;
+  masterGain.gain.setTargetAtTime(vol * 0.5, audioCtx.currentTime, 0.05);
+});
+</script>
+</body>
+</html>
