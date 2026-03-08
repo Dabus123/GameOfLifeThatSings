@@ -4,7 +4,7 @@ Two implementations of Conway's Game of Life that got out of hand.
 
 ---
 
-## `stacked-life.html` — 100×100 Grid, 20 Layers
+## `stacked-life.html ` — 100×100 Grid, 20 Layers
 
 20 independent 2D Life simulations stacked in 3D space. Each layer runs B3/S23 simultaneously. Rendered as flush instanced cubes with speed tiers — bottom layers tick 4× faster than top layers, creating interference patterns where the fast and slow planes meet. A cross-layer rule can be toggled: dead cells ignite when the same position is alive in both the layer above and below.
 
@@ -14,7 +14,7 @@ Orbit, zoom, toggle cross-layer interaction.
 
 ---
 
-## `recursive-life.html` — 10,000 Universes with Sound
+## `game_of_life_that_sings-pentatonic.html & game_of_life_that_sings-schumann.html` — 10,000 Universes with Sound
 
 A 100×100 outer Game of Life grid where every cell *contains* a running 12×12 Life simulation.
 
